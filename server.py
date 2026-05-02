@@ -45,23 +45,51 @@ def check_token(req):
 
 # ── Endpoints do protocolo Push (chamados pelo iDFace) ───────────────────────
 
+def _resolve_device_id(req):
+    """
+    Monta um identificador único e estável para o dispositivo.
+    Prioridade:
+      1. Header X-Device-Serial  (enviado pelo controlid.py ao configurar o Push)
+      2. Query param serial
+      3. Header X-Device-Id
+      4. Query param device_id
+      5. IP remoto (fallback — pode variar por NAT)
+    """
+    serial = (req.headers.get("X-Device-Serial")
+              or req.args.get("serial", "").strip())
+    ip     = req.remote_addr
+
+    if serial:
+        return f"{serial}@{ip}", serial, ip
+
+    dev_id = (req.headers.get("X-Device-Id")
+              or req.args.get("device_id", "").strip()
+              or ip)
+    return dev_id, None, ip
+
+
 @app.route("/push", methods=["GET"])
 def push_poll():
     """
     O iDFace chama este endpoint periodicamente.
     Retornamos o próximo comando da fila, ou vazio se não houver.
     """
-    device_id = request.args.get("device_id", request.remote_addr)
+    device_key, serial, ip = _resolve_device_id(request)
     with lock:
-        devices[device_id] = {
-            "last_seen": now_str(),
-            "ip":        request.remote_addr,
+        # Atualiza ou cria registro do dispositivo
+        existing = devices.get(device_key, {})
+        devices[device_key] = {
+            "last_seen":    now_str(),
+            "ip":           ip,
+            "serial":       serial or existing.get("serial", "desconhecido"),
+            "poll_count":   existing.get("poll_count", 0) + 1,
+            "firmware":     request.headers.get("X-Firmware-Version",
+                            existing.get("firmware", "")),
         }
         if cmd_queue:
             cmd = cmd_queue.popleft()
             return jsonify(cmd)
 
-    # Sem comandos — retorna resposta vazia no formato esperado pelo firmware
     return jsonify({"transactions": []}), 200
 
 
@@ -71,16 +99,17 @@ def push_result():
     O iDFace posta aqui o resultado de cada comando executado.
     """
     data      = request.get_json(force=True, silent=True) or {}
-    device_id = request.args.get("device_id", request.remote_addr)
+    device_key, serial, ip = _resolve_device_id(request)
     with lock:
         results.appendleft({
             "received_at": now_str(),
-            "device_id":   device_id,
+            "device_id":   device_key,
+            "serial":      serial or "desconhecido",
+            "ip":          ip,
             "data":        data,
         })
-        # Atualiza last_seen do dispositivo
-        if device_id in devices:
-            devices[device_id]["last_seen"] = now_str()
+        if device_key in devices:
+            devices[device_key]["last_seen"] = now_str()
     return jsonify({"success": True}), 200
 
 
@@ -102,7 +131,17 @@ def list_devices():
     if not check_token(request):
         return jsonify({"error": "Unauthorized"}), 401
     with lock:
-        return jsonify({"devices": dict(devices)}), 200
+        # Agrupa por serial se disponível, evitando duplicatas por IP
+        seen_serials = set()
+        resultado = {}
+        for key, info in devices.items():
+            serial = info.get("serial", "")
+            if serial and serial != "desconhecido":
+                if serial in seen_serials:
+                    continue
+                seen_serials.add(serial)
+            resultado[key] = info
+        return jsonify({"devices": resultado}), 200
 
 
 @app.route("/cmd", methods=["POST"])
