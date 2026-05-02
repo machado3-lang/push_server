@@ -225,15 +225,45 @@ def list_devices():
     if not check_token(request):
         return jsonify({"error": "Unauthorized"}), 401
 
+    # Janela máxima de idade para exibir um dispositivo (padrão: 24 horas)
+    max_age_h = int(request.args.get("max_age_hours", 24))
+    cutoff = datetime.now() - timedelta(hours=max_age_h)
+
     with lock:
+        # Ordena do mais recente para o mais antigo — dedup mantém a entrada mais nova
+        sorted_devs = sorted(
+            devices.items(),
+            key=lambda kv: kv[1].get("last_seen", ""),
+            reverse=True,
+        )
+
         seen_serials = set()
-        resultado = {}
-        for key, info in devices.items():
+        seen_ips     = set()
+        resultado    = {}
+
+        for key, info in sorted_devs:
+            # Ignora entradas mais antigas que max_age_h
+            try:
+                last_dt = datetime.strptime(info.get("last_seen", ""), "%d/%m/%Y %H:%M:%S")
+                if last_dt < cutoff:
+                    continue
+            except Exception:
+                continue
+
             serial = info.get("serial", "")
+            ip     = info.get("ip", "")
+
+            # Deduplicação por serial (prioridade)
             if serial and serial != "desconhecido":
                 if serial in seen_serials:
                     continue
                 seen_serials.add(serial)
+            # Deduplicação por IP (para equipamentos sem serial identificado)
+            elif ip:
+                if ip in seen_ips:
+                    continue
+                seen_ips.add(ip)
+
             info_out = dict(info)
             info_out["online"] = _is_online(info)
             resultado[key] = info_out
